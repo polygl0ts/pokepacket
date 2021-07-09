@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"bytes"
 	"encoding/hex"
 	"fmt"
@@ -19,10 +20,9 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v2"
+	"github.com/fsnotify/fsnotify"
 )
 
 var link_type layers.LinkType
@@ -224,30 +224,7 @@ func serve(port int) {
 	fmt.Printf("Hosting on http://localhost:%d\n", port)
 }
 
-func main() {
-	unix.Umask(unix.S_IROTH | unix.S_IWOTH)
-	config := init_config()
-	serve(config.Port)
-
-	var handle *pcap.Handle
-	var err error
-
-	if len(os.Args) == 1 {
-		fmt.Printf("dumping packets on %s\n", config.Iface)
-		update_time := time.Second // do we really want to capture each second
-		handle, err = pcap.OpenLive(config.Iface, 65536, false, update_time)
-	} else {
-		filename := os.Args[1]
-		fmt.Printf("parsing pcap %s\n", filename)
-		handle, err = pcap.OpenOffline(filename)
-	}
-	if err != nil {
-		fmt.Printf("failed to open pcap/interface: %v\n", err)
-		return
-	}
-
-
-
+func analyze(handle *pcap.Handle) {
 	link_type = handle.LinkType()
 
 	filter := ""
@@ -259,7 +236,7 @@ func main() {
 	}
 	fmt.Printf("Using bpf filter \"\x1b[33m%s\x1b[0m\"\n", filter)
 
-	err = handle.SetBPFFilter(filter)
+	err := handle.SetBPFFilter(filter)
 	if err != nil {
 		fmt.Printf("failed to set bpf filter")
 	}
@@ -269,20 +246,6 @@ func main() {
 	packets_flow := make(map[uint64][]gopacket.Packet)
 	packets_port := make(map[gopacket.Endpoint][]gopacket.Packet)
 
-	counter := promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "tcp",
-		Name:      "inbound_traffic_total_bytes",
-	}, []string{
-		"ip",
-	})
-
-	outbound := promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "tcp",
-		Name:      "outbound_traffic_total_bytes",
-	}, []string{
-		"ip",
-	})
-
 	flagBytes := []byte(config.Flag)
 
 	packetSrc := gopacket.NewPacketSource(handle, handle.LinkType())
@@ -291,7 +254,6 @@ func main() {
 		var srcIp gopacket.Endpoint
 		//var dstIp gopacket.Endpoint
 
-		var inbound bool
 		var servicePort gopacket.Endpoint
 
 		if netLayer := packet.NetworkLayer(); netLayer != nil {
@@ -319,11 +281,8 @@ func main() {
 			//servicePort = srcPort
 			//}
 			if _, ok := port_service_map[srcPort.String()]; ok {
-				//outgoing = true
-				inbound = false
 				servicePort = srcPort
 			} else {
-				inbound = true
 				servicePort = dstPort
 			}
 
@@ -357,14 +316,75 @@ func main() {
 			}
 		}
 		stats[srcIp] += uint64(packet.Metadata().CaptureInfo.CaptureLength)
-		c := counter
-		if !inbound {
-			c = outbound
-		}
-		c.WithLabelValues(srcIp.String()).Add(float64(packet.Metadata().CaptureLength))
 
 		//fmt.Printf("Received packet from %s to %s, size: %d\n", src, dest, packet.Metadata().CaptureInfo.CaptureLength)
 	}
 
+	defer handle.Close()
+}
+
+
+func pokenotify(folder string){
+
+	var handle *pcap.Handle
+	var err error
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer watcher.Close()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				log.Println("event:", event)
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					log.Println("This is where we want to return and pass the handle to pokeanalze: %s", event.Name)
+					handle, err = pcap.OpenOffline(event.Name)
+					analyze(handle)
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Println("error:", err)
+			}
+		}
+	}()
+
+	err = watcher.Add(folder)
+	if err != nil {
+		log.Fatal(err)
+	}
+	<-done
+}
+
+func main() {
+	var err error
+	unix.Umask(unix.S_IROTH | unix.S_IWOTH)
+	config := init_config()
+	serve(config.Port)
+
+
+	if len(os.Args) == 1 {
+		var handle *pcap.Handle
+		fmt.Printf("dumping packets on %s\n", config.Iface)
+		update_time := time.Second // do we really want to capture each second
+		handle, err = pcap.OpenLive(config.Iface, 65536, false, update_time)
+		analyze(handle)
+	} else {
+		folder := os.Args[1]
+		fmt.Printf("listening for events on folder %s\n", folder)
+		pokenotify(folder)
+	}
+	if err != nil {
+		fmt.Printf("failed to open pcap/interface: %v\n", err)
+		return
+	}
 	time.Sleep(50 * time.Hour)
 }
